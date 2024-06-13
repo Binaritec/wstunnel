@@ -6,7 +6,6 @@ use hickory_resolver::proto::iocompat::AsyncIoTokioAsStd;
 use hickory_resolver::proto::TokioTime;
 use hickory_resolver::{AsyncResolver, TokioHandle};
 use log::warn;
-use socket2::SockRef;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::pin::Pin;
@@ -104,6 +103,7 @@ impl DnsResolver {
 #[derive(Clone)]
 pub struct TokioRuntimeProviderWithSoMark {
     runtime: TokioRuntimeProvider,
+    #[cfg(target_os = "linux")]
     so_mark: Option<u32>,
 }
 
@@ -111,6 +111,7 @@ impl TokioRuntimeProviderWithSoMark {
     fn new(so_mark: Option<u32>) -> Self {
         Self {
             runtime: TokioRuntimeProvider::default(),
+            #[cfg(target_os = "linux")]
             so_mark,
         }
     }
@@ -129,7 +130,24 @@ impl RuntimeProvider for TokioRuntimeProviderWithSoMark {
 
     #[inline]
     fn connect_tcp(&self, server_addr: SocketAddr) -> Pin<Box<dyn Send + Future<Output = std::io::Result<Self::Tcp>>>> {
-        self.runtime.connect_tcp(server_addr)
+        let socket = TcpStream::connect(server_addr);
+
+        #[cfg(target_os = "linux")]
+        let socket = {
+            use socket2::SockRef;
+
+            socket.map({
+                let so_mark = self.so_mark;
+                move |sock| {
+                    if let (Ok(sock), Some(so_mark)) = (&sock, so_mark) {
+                        SockRef::from(sock).set_mark(so_mark)?;
+                    }
+                    sock
+                }
+            })
+        };
+
+        Box::pin(socket.map(|s| s.map(AsyncIoTokioAsStd)))
     }
 
     fn bind_udp(
@@ -140,15 +158,19 @@ impl RuntimeProvider for TokioRuntimeProviderWithSoMark {
         let socket = UdpSocket::bind(local_addr);
 
         #[cfg(target_os = "linux")]
-        let socket = socket.map({
-            let so_mark = self.so_mark;
-            move |sock| {
-                if let (Ok(sock), Some(so_mark)) = (&sock, so_mark) {
-                    SockRef::from(sock).set_mark(so_mark)?;
+        let socket = {
+            use socket2::SockRef;
+
+            socket.map({
+                let so_mark = self.so_mark;
+                move |sock| {
+                    if let (Ok(sock), Some(so_mark)) = (&sock, so_mark) {
+                        SockRef::from(sock).set_mark(so_mark)?;
+                    }
+                    sock
                 }
-                sock
-            }
-        });
+            })
+        };
 
         Box::pin(socket)
     }
